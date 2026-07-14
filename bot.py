@@ -1,4 +1,4 @@
-import os, math, logging, re, subprocess
+import os, math, logging, re, subprocess, shutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ConversationHandler
 import yt_dlp
@@ -17,42 +17,69 @@ logging.basicConfig(level=logging.ERROR)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
+def _detect_js_runtime():
+    """
+    ✅ FIX: node/deno PATH-এ আছে কিনা চেক করে yt-dlp কে এক্সপ্লিসিটলি path দেওয়া হয়,
+    কারণ কখনো কখনো yt-dlp নিজে PATH থেকে runtime auto-detect করতে ব্যর্থ হয়।
+    """
+    for name in ("deno", "node", "bun"):
+        path = shutil.which(name)
+        if path:
+            return {name: path}
+    return None
+
+
 def download_video(url, output_path):
     """
     yt-dlp দিয়ে ভিডিও ডাউনলোড করে।
-    Format error এড়াতে fallback chain ব্যবহার করা হয়েছে।
+    Format error এড়াতে fallback chain + EJS (n-challenge) solver ব্যবহার করা হয়েছে।
     """
+    js_runtimes = _detect_js_runtime()
+
     ydl_opts = {
-        # ✅ FIX: format fallback chain — যে format পাওয়া যাবে সেটাই নেবে
-        "format": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        # ✅ FIX: hard [ext=mp4]/[ext=m4a] filter সরানো হলো, এটা মাঝেমধ্যে
+        # ভ্যালিড format কেও reject করে ফেলছিল
+        "format": "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
         "outtmpl": output_path,
-        "merge_output_format": "mp4",         "ffmpeg_location": FFMPEG,
+        "merge_output_format": "mp4",
+        "ffmpeg_location": FFMPEG,
         "quiet": True,
         "no_warnings": True,
         "geo_bypass": True,
         "geo_bypass_country": "US",
-        "cookiefile": "cookies.txt" if os.path.exists("cookies.txt") else None,
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         "extractor_args": {
             "youtube": {
-                # ✅ FIX: android_vr এবং mweb যোগ করা হয়েছে — আরও বেশি format পাওয়া যাবে
-                "player_client": ["android", "android_vr", "web", "mweb"],
+                # ✅ FIX: কুকি থাকলে web client সবচেয়ে নির্ভরযোগ্য, বাকিগুলো fallback
+                "player_client": ["web", "tv", "android", "mweb"],
             }
         },
-        # ✅ FIX: retries যোগ করা হয়েছে network error এর জন্য
-        "retries": 5,
-        "fragment_retries": 5,
+        # ✅ FIX: n-challenge (nsig) সলভ করার জন্য EJS remote solver enable করা হলো
+        # এটা ছাড়া node/deno থাকলেও শুধু storyboard format পাওয়া যায়
+        "remote_components": "ejs:github",
+        "retries": 10,
+        "fragment_retries": 10,
+        "socket_timeout": 30,
     }
+
+    if js_runtimes:
+        ydl_opts["js_runtimes"] = js_runtimes
+
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         fname = ydl.prepare_filename(info)
-        # .webm বা .mkv হলে .mp4 করে দাও
+        # ✅ FIX: শুধু extension এর শেষে match করে replace করা হচ্ছে,
+        # আগে path-এর মাঝে "webm"/"mkv" শব্দ থাকলেও ভুল replace হতো
         for ext in [".webm", ".mkv"]:
-            fname = fname.replace(ext, ".mp4")
+            if fname.endswith(ext):
+                fname = fname[: -len(ext)] + ".mp4"
         return fname
 
 
@@ -340,7 +367,7 @@ async def process_video(message, context):
         )
 
     except Exception as e:
-        # ✅ FIX: error message আরও helpful করা হয়েছে
+        # ✅ error message আরও helpful করা হয়েছে
         err = str(e)
         if "Requested format is not available" in err:
             await message.reply_text(
